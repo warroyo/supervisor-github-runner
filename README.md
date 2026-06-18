@@ -4,11 +4,19 @@ A self-hosted GitHub Actions runner that runs as a single
 [vSphere Pod](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere-supervisor/8-0/using-tkg-service-with-vsphere-supervisor/deploying-workloads-to-vsphere-pods.html)
 on a vSphere Supervisor cluster.
 
-This is a bootstrap runner: something that exists just to run the Terraform
-that stands up the rest of the infrastructure. Since it's the first thing to
-come up, it leans on nothing fancy — no CRDs, no operators, no Helm, just plain
-`ServiceAccount`, `Role`, `Secret`, `ConfigMap`, and `Deployment`. If you can
-`kubectl apply` it, you can run it.
+It's a generic way to run GitHub Actions on Supervisor — any workflow that can
+run inside a restricted, unprivileged pod works here, not just one kind of job.
+The whole thing leans on nothing fancy: no CRDs, no operators, no Helm, just
+plain `ServiceAccount`, `Role`, `Secret`, `ConfigMap`, and `Deployment`. If you
+can `kubectl apply` it, you can run it.
+
+The one real limitation is building container images. Supervisor enforces a
+restricted Pod Security profile — no privileged containers, no Docker-in-Docker
+— so workflows that build images (`docker build`, plain Buildah/Kaniko that
+need privileges, etc.) won't run here. Everything else — Terraform, CLIs, tests,
+deploys, API calls — is fair game. A common use is bootstrap work: running the
+Terraform that stands up the rest of the infrastructure, which is why the RBAC
+below is wired up for Terraform's Kubernetes backend out of the box.
 
 A note on the namespace before you start: on Supervisor you don't create
 namespaces with YAML. They're Supervisor Namespaces, created in vCenter under
@@ -54,10 +62,11 @@ shared `emptyDir`: the init container writes the JIT config, the runner reads it
 There's nothing custom to build or host. The token-minting logic is a Python
 script living in a ConfigMap, run by the stock `python:3-slim` image, and the
 runner is the unmodified `ghcr.io/actions/runner` image. Nothing persists
-either — the work directory is an `emptyDir`, and Terraform state goes to the
+either — the work directory is an `emptyDir`, wiped on every restart. If your
+workflow needs durable state, keep it off the runner: Terraform users, for
+example, can point the
 [Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-(a Secret for state, a Lease for locking), so there's no reason to keep a disk
-around.
+at an in-cluster Secret (see the end of this README).
 
 ## Security model
 
@@ -211,12 +220,15 @@ bump the tag (it's the release version minus the leading `v`). GitHub expects
 self-hosted runners to stay reasonably current, so it's worth checking in on
 this now and then.
 
-## Terraform's Kubernetes backend
+## Optional: Terraform's Kubernetes backend
 
-The RBAC in `01-serviceaccount-rbac.yaml` grants exactly what the
+If you're using this for Terraform, the RBAC in `01-serviceaccount-rbac.yaml`
+is already set up for the
 [Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-needs and nothing more: secrets for the state, leases for locking, scoped to
-`github-runners`. Configure Terraform like this:
+and grants exactly what it needs and nothing more: secrets for the state, leases
+for locking, scoped to `github-runners`. If you're running something else, this
+section is just dead weight — you can drop those rules from the Role. To use it,
+configure Terraform like this:
 
 ```hcl
 terraform {
