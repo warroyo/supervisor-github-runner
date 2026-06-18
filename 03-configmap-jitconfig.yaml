@@ -1,26 +1,5 @@
-# 03-configmap-jitconfig.yaml
-#
-# The token-minting logic, as a Python script stored in a ConfigMap.
-#
-# Why a ConfigMap + stock python:3-slim instead of a custom image:
-#   This is a bootstrap-tier runner -- we want the fewest moving parts and
-#   nothing to build/host. Mounting this script into the unmodified
-#   python:3-slim image means there is no registry, no image build pipeline,
-#   and no Dockerfile to maintain for the privileged half of the pod.
-#
-# What the init container does with this (see 04-deployment.yaml):
-#   1. Build a short-lived JWT signed with the GitHub App private key (RS256,
-#      via PyJWT). The key is mounted from the github-app Secret into the init
-#      container ONLY.
-#   2. Exchange the JWT for a short-lived *installation* access token scoped to
-#      the App's installation on the target repo.
-#   3. Call POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig to
-#      mint a Just-In-Time runner configuration.
-#   4. Write the encoded JIT config to a shared emptyDir, which the runner
-#      container then consumes via `run.sh --jitconfig`.
-#
-# The runner container never sees the App private key or the installation
-# token -- only the (single-use, ephemeral) JIT config blob.
+# Python token-minting script run by the init container.
+# See README "How it works" for the design rationale.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -29,14 +8,10 @@ metadata:
 data:
   mint_jitconfig.py: |
     #!/usr/bin/env python3
-    """Mint a Just-In-Time (JIT) GitHub Actions runner config.
+    """Sign a GitHub App JWT, exchange it for an installation token, mint an
+    ephemeral JIT runner config, and write it to the shared volume.
 
-    Reads a GitHub App private key + App ID, signs a JWT, exchanges it for an
-    installation token, requests an ephemeral JIT runner config for a repo, and
-    writes the encoded config to a shared volume for the runner container.
-
-    Dependencies: PyJWT[crypto] (installed at init-container start). Everything
-    else uses the Python standard library so there is nothing else to install.
+    Only third-party dependency is PyJWT[crypto] (installed at init start).
     """
     import json
     import os
@@ -85,8 +60,7 @@ data:
         with open(KEY_PATH, "rb") as fh:
             private_key = fh.read()
 
-        # 1. Build the App JWT. GitHub requires exp - iat <= 600s; we backdate
-        #    iat by 30s to tolerate clock skew between the pod and GitHub.
+        # App JWT (exp - iat <= 600s; backdate iat for clock skew).
         now = int(time.time())
         app_jwt = jwt.encode(
             {"iat": now - 30, "exp": now + 480, "iss": APP_ID},
@@ -94,8 +68,7 @@ data:
             algorithm="RS256",
         )
 
-        # 2. Resolve the App's installation on the target repo, then mint a
-        #    short-lived installation access token from it.
+        # Installation token for the App's install on the target repo.
         installation = api("GET", "/repos/{}/{}/installation".format(OWNER, REPO), app_jwt)
         token_resp = api(
             "POST",
@@ -105,9 +78,7 @@ data:
         )
         inst_token = token_resp["token"]
 
-        # 3. Request a JIT runner config. runner_group_id 1 is the always-present
-        #    "Default" self-hosted runner group. The runner registered from this
-        #    config is ephemeral: it runs exactly one job, then deregisters.
+        # Ephemeral JIT config (runner_group_id 1 = the "Default" group).
         jit = api(
             "POST",
             "/repos/{}/{}/actions/runners/generate-jitconfig".format(OWNER, REPO),
@@ -120,8 +91,7 @@ data:
             },
         )
 
-        # 4. Hand the encoded config off to the runner container via the shared
-        #    emptyDir. 0600 so only the (shared) runtime UID can read it.
+        # Hand off to the runner container via the shared volume.
         with open(OUT_PATH, "w") as fh:
             fh.write(jit["encoded_jit_config"])
         os.chmod(OUT_PATH, 0o600)

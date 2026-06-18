@@ -1,30 +1,6 @@
-# 04-deployment.yaml
-#
-# The runner pod: an init container that mints a JIT config, and the stock
-# GitHub Actions runner container that consumes it.
-#
-# Lifecycle / why this shape:
-#   - replicas: 1 -- a single runner. The runner registers as EPHEMERAL (the
-#     JIT config from the init container is inherently single-use), so it runs
-#     exactly one job, deregisters itself from GitHub, and exits 0. No stale
-#     "offline" runner is ever left behind in the repo's runner list.
-#   - When the runner exits after its one job, the Deployment's pod restart
-#     policy (always, for a Deployment) recreates the pod. The init container
-#     runs again and mints a FRESH JIT config, so the next pod picks up the next
-#     job. This is the "one pod, one job, then recycle" pattern without any
-#     controller/operator.
-#   - No PersistentVolumeClaim. The work directory is an emptyDir; Terraform
-#     state lives in the Kubernetes backend (an in-cluster Secret + Lease), so
-#     nothing on the runner needs to survive a restart.
-#
-# Security (vSphere Supervisor restricted Pod Security profile):
-#   - runAsNonRoot, a non-root UID, no privilege escalation, ALL capabilities
-#     dropped, RuntimeDefault seccomp. No privileged containers, no hostNetwork,
-#     no hostPID, no Docker-in-Docker.
-#   - The GitHub App private key Secret is mounted into the INIT container only.
-#     The runner container -- which executes untrusted workflow code -- never
-#     has access to the App key or the installation token, only the single-use
-#     JIT config handed over through the shared emptyDir.
+# Runner pod: init container mints a JIT config, stock runner container
+# consumes it. Ephemeral (one job per pod, then recycled). See the README for
+# the full design, lifecycle, and security notes.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,8 +13,6 @@ spec:
   selector:
     matchLabels:
       app: github-runner
-  # Recreate (not RollingUpdate): we only ever want one runner identity at a
-  # time, and the pod is short-lived by design.
   strategy:
     type: Recreate
   template:
@@ -47,14 +21,9 @@ spec:
         app: github-runner
     spec:
       serviceAccountName: github-runner
-      # restartPolicy is Always for Deployment-managed pods (implicit). When the
-      # ephemeral runner finishes its job and exits, the pod is recreated and a
-      # new JIT config is minted by the init container.
+      # Both containers share UID 1001 (the runner image's "runner" user) so the
+      # runner can read the JIT file written by the init container.
       securityContext:
-        # Pod-level security context shared by both containers. Both run as the
-        # same non-root UID (1001 == the "runner" user baked into the official
-        # runner image) so the JIT config file written by the init container is
-        # readable by the runner container.
         runAsNonRoot: true
         runAsUser: 1001
         runAsGroup: 1001
@@ -62,11 +31,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
-        # ---------------------------------------------------------------------
-        # Token minter. Stock python:3-slim + the script from the ConfigMap.
-        # Installs PyJWT[crypto] at start (no custom image), then runs the
-        # script which writes the JIT config to the shared emptyDir.
-        # ---------------------------------------------------------------------
+        # Stock python:3-slim + the ConfigMap script. App key is mounted here only.
         - name: mint-jitconfig
           image: python:3-slim
           command: ["/bin/sh", "-c"]
@@ -74,9 +39,7 @@ spec:
             - |
               set -eu
               export HOME=/tmp
-              # Install into a writable, non-root location and add it to the
-              # import path. python:3-slim ships no third-party packages, and as
-              # a non-root user we cannot write to the system site-packages.
+              # Non-root can't write system site-packages; install to /tmp.
               pip install --no-cache-dir --disable-pip-version-check \
                 --target /tmp/pylibs 'PyJWT[crypto]==2.8.0'
               PYTHONPATH=/tmp/pylibs exec python /scripts/mint_jitconfig.py
@@ -95,7 +58,6 @@ spec:
               value: "REPLACE_WITH_REPO_NAME" # e.g. "supervisor-github-runner"
             # ----------------------------------------------------
             - name: RUNNER_NAME
-              # Per-pod runner name so concurrent/sequential pods never collide.
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
@@ -114,7 +76,7 @@ spec:
               mountPath: /runner-config
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: false # pip writes to /tmp/pylibs
+            readOnlyRootFilesystem: false
             capabilities:
               drop: ["ALL"]
           resources:
@@ -125,20 +87,13 @@ spec:
               cpu: 500m
               memory: 256Mi
       containers:
-        # ---------------------------------------------------------------------
-        # The runner. Unmodified upstream image, pinned to the latest stable
-        # release (https://github.com/actions/runner/releases). It reads the JIT
-        # config from the shared emptyDir and starts with --jitconfig, so there
-        # is no config.sh registration step and no registration token on disk.
-        # ---------------------------------------------------------------------
+        # Unmodified upstream runner, pinned. Starts with --jitconfig (no config.sh).
         - name: runner
           image: ghcr.io/actions/runner:2.335.1
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -eu
-              # The runner deregisters itself automatically because the JIT
-              # config is ephemeral/single-use; --once is implied by JIT.
               exec ./run.sh --jitconfig "$(cat /runner-config/jitconfig)"
           volumeMounts:
             - name: runner-config
@@ -158,19 +113,15 @@ spec:
               cpu: "2"
               memory: 2Gi
       volumes:
-        # GitHub App credentials -- init container only.
-        - name: github-app
+        - name: github-app # init container only
           secret:
             secretName: github-app
             defaultMode: 0400
-        # The Python token-minting script from the ConfigMap.
         - name: jitconfig-script
           configMap:
             name: runner-jitconfig
             defaultMode: 0555
-        # Handoff channel for the JIT config between init and runner containers.
-        - name: runner-config
+        - name: runner-config # JIT config handoff
           emptyDir: {}
-        # Runner work directory. Ephemeral by design -- no PVC.
         - name: work
           emptyDir: {}

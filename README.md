@@ -56,6 +56,20 @@ Key design points:
   stored in the [Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
   (an in-cluster `Secret` + a `Lease` for locking), not on the runner's disk.
 
+## Security model
+
+- Complies with the Supervisor's **restricted** Pod Security profile:
+  `runAsNonRoot`, no privilege escalation, **all** capabilities dropped,
+  `RuntimeDefault` seccomp, no `hostNetwork`/`hostPID`, no privileged
+  containers, and no Docker-in-Docker.
+- Both containers run as **UID 1001** — the `runner` user baked into the
+  official runner image — with `fsGroup: 1001` so the runner can read the JIT
+  file the init container writes (`0600`) on the shared `emptyDir`.
+- The `github-app` Secret is mounted into the **init container only**; the
+  runner container never has the App key or the installation token.
+- The Deployment uses `strategy: Recreate` and `replicas: 1` so there is only
+  ever one runner identity at a time.
+
 ## Files (apply in numeric order)
 
 | File | Purpose |
