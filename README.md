@@ -7,7 +7,16 @@ on a VMware vSphere **Supervisor** cluster.
 It is a **bootstrap-tier runner**: its purpose is to run Terraform that
 provisions infrastructure, so it deliberately relies on **core Kubernetes
 resources only** — no CRDs, no operators, no Helm. Everything here is plain
-`Namespace` / `ServiceAccount` / `Role` / `Secret` / `ConfigMap` / `Deployment`.
+`ServiceAccount` / `Role` / `Secret` / `ConfigMap` / `Deployment`.
+
+> **Namespace is a prerequisite, not a manifest.** On vSphere Supervisor the
+> namespace is a **Supervisor Namespace** created in vCenter (Workload
+> Management → Namespaces), which is where its resource limits, storage, and
+> Pod Security policy come from. You cannot create it with `kubectl apply` of a
+> `Namespace` object, so there is no `namespace.yaml` here — these manifests
+> assume the namespace already exists. They use the name `github-runners`;
+> either create your Supervisor Namespace with that name, or change the
+> `namespace:` field in each manifest to match yours.
 
 ## How it works
 
@@ -51,16 +60,20 @@ Key design points:
 
 | File | Purpose |
 |------|---------|
-| `00-namespace.yaml` | The `github-runners` namespace (labeled `restricted` PSS). |
 | `01-serviceaccount-rbac.yaml` | `ServiceAccount` + `Role`/`RoleBinding` granting the Terraform Kubernetes backend access to **secrets** and **leases** in this namespace only. |
 | `02-secret.yaml` | The GitHub App ID + private key (placeholders — see below). |
 | `03-configmap-jitconfig.yaml` | The Python token-minting script. |
 | `04-deployment.yaml` | The init container + stock runner container + shared `emptyDir`. |
 
+(There is no `00-namespace.yaml` — the namespace is a Supervisor Namespace
+created in vCenter; see the note at the top.)
+
 ## Prerequisites
 
-- A vSphere Supervisor namespace with a `kubectl` context pointing at it, and
-  permission to create the resources above.
+- A **Supervisor Namespace** named `github-runners` (or your own name, with the
+  `namespace:` field in each manifest changed to match), already created in
+  vCenter under **Workload Management → Namespaces**, with a `kubectl` context
+  pointing at it and permission to create the resources above.
 - The Supervisor's **restricted** Pod Security profile is satisfied by the pod
   spec as written (`runAsNonRoot`, all capabilities dropped,
   `allowPrivilegeEscalation: false`, `RuntimeDefault` seccomp, no host
@@ -104,8 +117,6 @@ Create the Secret directly from your files (recommended — avoids
 base64/whitespace mistakes with the multi-line PEM):
 
 ```sh
-kubectl apply -f 00-namespace.yaml
-
 kubectl -n github-runners create secret generic github-app \
   --from-literal=app-id='YOUR_APP_ID' \
   --from-file=private-key.pem=./your-app.private-key.pem
@@ -134,8 +145,9 @@ If you populated the Secret declaratively via `02-secret.yaml` instead of the
 
 ## 4. Apply (in order)
 
+The Supervisor Namespace must already exist (see Prerequisites).
+
 ```sh
-kubectl apply -f 00-namespace.yaml
 kubectl apply -f 01-serviceaccount-rbac.yaml
 kubectl apply -f 02-secret.yaml            # skip if you used `kubectl create secret`
 kubectl apply -f 03-configmap-jitconfig.yaml
