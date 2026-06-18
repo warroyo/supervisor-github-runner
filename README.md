@@ -15,8 +15,8 @@ restricted Pod Security profile — no privileged containers, no Docker-in-Docke
 — so workflows that build images (`docker build`, plain Buildah/Kaniko that
 need privileges, etc.) won't run here. Everything else — Terraform, CLIs, tests,
 deploys, API calls — is fair game. A common use is bootstrap work: running the
-Terraform that stands up the rest of the infrastructure, which is why the RBAC
-below is wired up for Terraform's Kubernetes backend out of the box.
+Terraform that stands up the rest of the infrastructure before anything heavier
+exists to run it on.
 
 A note on the namespace before you start: on Supervisor you don't create
 namespaces with YAML. They're Supervisor Namespaces, created in vCenter under
@@ -62,11 +62,9 @@ shared `emptyDir`: the init container writes the JIT config, the runner reads it
 There's nothing custom to build or host. The token-minting logic is a Python
 script living in a ConfigMap, run by the stock `python:3-slim` image, and the
 runner is the unmodified `ghcr.io/actions/runner` image. Nothing persists
-either — the work directory is an `emptyDir`, wiped on every restart. If your
-workflow needs durable state, keep it off the runner: Terraform users, for
-example, can point the
-[Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-at an in-cluster Secret (see the end of this README).
+either — the work directory is an `emptyDir`, wiped on every restart. If a
+workflow needs durable state, keep it off the runner and in a remote backend
+(an object store, a Terraform remote backend, and so on).
 
 ## Security model
 
@@ -78,9 +76,10 @@ Docker-in-Docker.
 Both containers run as UID 1001 — that's the `runner` user the official image
 ships with — and the pod sets `fsGroup: 1001` so the runner can read the JIT
 file the init container drops on the shared volume (written `0600`). The
-`github-app` Secret is mounted into the init container only. And with
-`replicas: 1` plus `strategy: Recreate`, there's only ever one runner identity
-alive at a time.
+`github-app` Secret is mounted into the init container only. The runner has its
+own ServiceAccount but no RBAC and no mounted token, so the untrusted workflow
+code it runs can't reach the Kubernetes API at all. And with `replicas: 1` plus
+`strategy: Recreate`, there's only ever one runner identity alive at a time.
 
 ## What's in here
 
@@ -88,7 +87,7 @@ Apply them in order; the numbers are the order.
 
 | File | What it does |
 |------|--------------|
-| `01-serviceaccount-rbac.yaml` | The runner's ServiceAccount, plus a Role/RoleBinding letting Terraform's Kubernetes backend touch secrets and leases — in this namespace only. |
+| `01-serviceaccount.yaml` | The runner's ServiceAccount — no RBAC, no mounted token. |
 | `02-secret.yaml` | The GitHub App ID and private key (placeholders for now). |
 | `03-configmap-jitconfig.yaml` | The Python token-minting script. |
 | `04-deployment.yaml` | The init container, the runner container, and the shared `emptyDir` between them. |
@@ -162,7 +161,7 @@ and `private-key.pem` placeholders in `02-secret.yaml` too.
 With the namespace already in place:
 
 ```sh
-kubectl apply -f 01-serviceaccount-rbac.yaml
+kubectl apply -f 01-serviceaccount.yaml
 kubectl apply -f 02-secret.yaml            # skip if you used `kubectl create secret`
 kubectl apply -f 03-configmap-jitconfig.yaml
 kubectl apply -f 04-deployment.yaml
@@ -219,27 +218,3 @@ When a new release lands on
 bump the tag (it's the release version minus the leading `v`). GitHub expects
 self-hosted runners to stay reasonably current, so it's worth checking in on
 this now and then.
-
-## Optional: Terraform's Kubernetes backend
-
-If you're using this for Terraform, the RBAC in `01-serviceaccount-rbac.yaml`
-is already set up for the
-[Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-and grants exactly what it needs and nothing more: secrets for the state, leases
-for locking, scoped to `github-runners`. If you're running something else, this
-section is just dead weight — you can drop those rules from the Role. To use it,
-configure Terraform like this:
-
-```hcl
-terraform {
-  backend "kubernetes" {
-    secret_suffix     = "bootstrap"
-    namespace         = "github-runners"
-    in_cluster_config = true   # use the pod's ServiceAccount token
-  }
-}
-```
-
-With `in_cluster_config = true`, Terraform authenticates as the `github-runner`
-ServiceAccount, so the backend can manage its state Secret and grab its lock
-Lease without any extra credentials.
