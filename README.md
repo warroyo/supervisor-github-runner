@@ -6,9 +6,9 @@ on a vSphere Supervisor cluster.
 
 It's a generic way to run GitHub Actions on Supervisor — any workflow that can
 run inside a restricted, unprivileged pod works here, not just one kind of job.
-The whole thing leans on nothing fancy: no CRDs, no operators, no Helm, just
-plain `ServiceAccount`, `Role`, `Secret`, `ConfigMap`, and `Deployment`. If you
-can `kubectl apply` it, you can run it.
+The whole thing leans on nothing fancy: no CRDs, no operators, no Helm, just a
+plain `Secret`, `ConfigMap`, and `Deployment`. If you can `kubectl apply` it,
+you can run it.
 
 The one real limitation is building container images. Supervisor enforces a
 restricted Pod Security profile — no privileged containers, no Docker-in-Docker
@@ -76,10 +76,10 @@ Docker-in-Docker.
 Both containers run as UID 1001 — that's the `runner` user the official image
 ships with — and the pod sets `fsGroup: 1001` so the runner can read the JIT
 file the init container drops on the shared volume (written `0600`). The
-`github-app` Secret is mounted into the init container only. The runner has its
-own ServiceAccount but no RBAC and no mounted token, so the untrusted workflow
-code it runs can't reach the Kubernetes API at all. And with `replicas: 1` plus
-`strategy: Recreate`, there's only ever one runner identity alive at a time.
+`github-app` Secret is mounted into the init container only. The pod sets
+`automountServiceAccountToken: false`, so the untrusted workflow code the runner
+executes gets no Kubernetes API token at all. And with `replicas: 1` plus
+`strategy: Recreate`, there's only ever one runner alive at a time.
 
 ## What's in here
 
@@ -87,10 +87,9 @@ Apply them in order; the numbers are the order.
 
 | File | What it does |
 |------|--------------|
-| `01-serviceaccount.yaml` | The runner's ServiceAccount — no RBAC, no mounted token. |
-| `02-secret.yaml` | The GitHub App ID and private key (placeholders for now). |
-| `03-configmap-jitconfig.yaml` | The Python token-minting script. |
-| `04-deployment.yaml` | The init container, the runner container, and the shared `emptyDir` between them. |
+| `01-secret.yaml` | The GitHub App ID and private key (placeholders for now). |
+| `02-configmap-jitconfig.yaml` | The Python token-minting script. |
+| `03-deployment.yaml` | The init container, the runner container, and the shared `emptyDir` between them. |
 
 (No `00-namespace.yaml` on purpose — see the namespace note up top.)
 
@@ -137,13 +136,13 @@ kubectl -n github-runners create secret generic github-app \
   --from-file=private-key.pem=./your-app.private-key.pem
 ```
 
-That gives you the same `github-app` Secret that `02-secret.yaml` describes. If
-you'd rather keep it in Git, edit `02-secret.yaml` instead and run it through
+That gives you the same `github-app` Secret that `01-secret.yaml` describes. If
+you'd rather keep it in Git, edit `01-secret.yaml` instead and run it through
 something like SOPS or Sealed Secrets — just don't commit a plaintext key.
 
 ## 3. Fill in the repo placeholders
 
-Open `04-deployment.yaml` and point it at your repo by replacing the two
+Open `03-deployment.yaml` and point it at your repo by replacing the two
 placeholders in the init container's env:
 
 ```yaml
@@ -154,17 +153,16 @@ placeholders in the init container's env:
 ```
 
 If you went the declarative route in step 2, remember to fill in the `app-id`
-and `private-key.pem` placeholders in `02-secret.yaml` too.
+and `private-key.pem` placeholders in `01-secret.yaml` too.
 
 ## 4. Apply
 
 With the namespace already in place:
 
 ```sh
-kubectl apply -f 01-serviceaccount.yaml
-kubectl apply -f 02-secret.yaml            # skip if you used `kubectl create secret`
-kubectl apply -f 03-configmap-jitconfig.yaml
-kubectl apply -f 04-deployment.yaml
+kubectl apply -f 01-secret.yaml            # skip if you used `kubectl create secret`
+kubectl apply -f 02-configmap-jitconfig.yaml
+kubectl apply -f 03-deployment.yaml
 ```
 
 ## 5. Check that it works
@@ -207,7 +205,7 @@ and it's back to `Listening for Jobs` waiting on the next one.
 
 ## Bumping the runner version
 
-The runner image is pinned in `04-deployment.yaml`:
+The runner image is pinned in `03-deployment.yaml`:
 
 ```yaml
 image: ghcr.io/actions/runner:2.335.1

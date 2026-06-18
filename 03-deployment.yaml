@@ -20,7 +20,9 @@ spec:
       labels:
         app: github-runner
     spec:
-      serviceAccountName: github-runner
+      # The runner has no reason to reach the Kubernetes API, so don't mount a
+      # token for it (it uses the namespace default ServiceAccount).
+      automountServiceAccountToken: false
       # Both containers share UID 1001 (the runner image's "runner" user) so the
       # runner can read the JIT file written by the init container.
       securityContext:
