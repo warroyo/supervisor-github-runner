@@ -1,0 +1,129 @@
+# Runner pod: init container mints a JIT config, stock runner container
+# consumes it. Ephemeral (one job per pod, then recycled). See the README for
+# the full design, lifecycle, and security notes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-runner
+  namespace: github-runners
+  labels:
+    app: github-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-runner
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: github-runner
+    spec:
+      # The runner has no reason to reach the Kubernetes API, so don't mount a
+      # token for it (it uses the namespace default ServiceAccount).
+      automountServiceAccountToken: false
+      # Both containers share UID 1001 (the runner image's "runner" user) so the
+      # runner can read the JIT file written by the init container.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Stock python:3-slim + the ConfigMap script. App key is mounted here only.
+        - name: mint-jitconfig
+          image: python:3-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              export HOME=/tmp
+              # Non-root can't write system site-packages; install to /tmp.
+              pip install --no-cache-dir --disable-pip-version-check \
+                --target /tmp/pylibs 'PyJWT[crypto]==2.8.0'
+              PYTHONPATH=/tmp/pylibs exec python /scripts/mint_jitconfig.py
+          env:
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app
+                  key: app-id
+            - name: APP_PRIVATE_KEY_PATH
+              value: /github-app/private-key.pem
+            # ---- REPO SCOPE: replace these two placeholders ----
+            - name: REPO_OWNER
+              value: "REPLACE_WITH_REPO_OWNER" # e.g. "warroyo"
+            - name: REPO_NAME
+              value: "REPLACE_WITH_REPO_NAME" # e.g. "supervisor-github-runner"
+            # ----------------------------------------------------
+            - name: RUNNER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUNNER_LABELS
+              value: "self-hosted,lab-supervisor"
+            - name: JITCONFIG_PATH
+              value: /runner-config/jitconfig
+          volumeMounts:
+            - name: github-app
+              mountPath: /github-app
+              readOnly: true
+            - name: jitconfig-script
+              mountPath: /scripts
+              readOnly: true
+            - name: runner-config
+              mountPath: /runner-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        # Unmodified upstream runner, pinned. Starts with --jitconfig (no config.sh).
+        - name: runner
+          image: ghcr.io/actions/runner:2.335.1
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              exec ./run.sh --jitconfig "$(cat /runner-config/jitconfig)"
+          volumeMounts:
+            - name: runner-config
+              mountPath: /runner-config
+              readOnly: true
+            - name: work
+              mountPath: /home/runner/_work
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: github-app # init container only
+          secret:
+            secretName: github-app
+            defaultMode: 0400
+        - name: jitconfig-script
+          configMap:
+            name: runner-jitconfig
+            defaultMode: 0555
+        - name: runner-config # JIT config handoff
+          emptyDir: {}
+        - name: work
+          emptyDir: {}

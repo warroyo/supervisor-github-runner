@@ -1,0 +1,102 @@
+# Python token-minting script run by the init container.
+# See README "How it works" for the design rationale.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runner-jitconfig
+  namespace: github-runners
+data:
+  mint_jitconfig.py: |
+    #!/usr/bin/env python3
+    """Sign a GitHub App JWT, exchange it for an installation token, mint an
+    ephemeral JIT runner config, and write it to the shared volume.
+
+    Only third-party dependency is PyJWT[crypto] (installed at init start).
+    """
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    import jwt  # PyJWT
+
+    API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    APP_ID = os.environ["GITHUB_APP_ID"]
+    OWNER = os.environ["REPO_OWNER"]
+    REPO = os.environ["REPO_NAME"]
+    RUNNER_NAME = os.environ.get("RUNNER_NAME", "lab-supervisor-runner")
+    LABELS = os.environ.get("RUNNER_LABELS", "self-hosted,lab-supervisor")
+    KEY_PATH = os.environ.get("APP_PRIVATE_KEY_PATH", "/github-app/private-key.pem")
+    OUT_PATH = os.environ.get("JITCONFIG_PATH", "/runner-config/jitconfig")
+
+
+    def api(method, path, token, data=None):
+        """Make a GitHub API call and return the parsed JSON response."""
+        url = path if path.startswith("http") else API + path
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Authorization", "Bearer " + token)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", "supervisor-github-runner-init")
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            sys.stderr.write(
+                "GitHub API {} {} failed: HTTP {}\n{}\n".format(
+                    method, url, exc.code, detail
+                )
+            )
+            raise
+
+
+    def main():
+        with open(KEY_PATH, "rb") as fh:
+            private_key = fh.read()
+
+        # App JWT (exp - iat <= 600s; backdate iat for clock skew).
+        now = int(time.time())
+        app_jwt = jwt.encode(
+            {"iat": now - 30, "exp": now + 480, "iss": APP_ID},
+            private_key,
+            algorithm="RS256",
+        )
+
+        # Installation token for the App's install on the target repo.
+        installation = api("GET", "/repos/{}/{}/installation".format(OWNER, REPO), app_jwt)
+        token_resp = api(
+            "POST",
+            "/app/installations/{}/access_tokens".format(installation["id"]),
+            app_jwt,
+            data={},
+        )
+        inst_token = token_resp["token"]
+
+        # Ephemeral JIT config (runner_group_id 1 = the "Default" group).
+        jit = api(
+            "POST",
+            "/repos/{}/{}/actions/runners/generate-jitconfig".format(OWNER, REPO),
+            inst_token,
+            data={
+                "name": RUNNER_NAME,
+                "runner_group_id": 1,
+                "labels": [s.strip() for s in LABELS.split(",") if s.strip()],
+                "work_folder": "_work",
+            },
+        )
+
+        # Hand off to the runner container via the shared volume.
+        with open(OUT_PATH, "w") as fh:
+            fh.write(jit["encoded_jit_config"])
+        os.chmod(OUT_PATH, 0o600)
+        print("Wrote JIT config for runner '{}' to {}".format(RUNNER_NAME, OUT_PATH))
+
+
+    if __name__ == "__main__":
+        main()
