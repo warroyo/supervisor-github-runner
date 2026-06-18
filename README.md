@@ -4,11 +4,11 @@ A self-hosted GitHub Actions runner that runs as a single
 [vSphere Pod](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere-supervisor/8-0/using-tkg-service-with-vsphere-supervisor/deploying-workloads-to-vsphere-pods.html)
 on a vSphere Supervisor cluster.
 
-I use this as a bootstrap runner: something that exists just to run the
-Terraform that stands up the rest of the infrastructure. Because it's the
-first thing to come up, I wanted it to lean on nothing fancy — no CRDs, no
-operators, no Helm, just plain `ServiceAccount`, `Role`, `Secret`, `ConfigMap`,
-and `Deployment`. If you can `kubectl apply` it, you can run it.
+This is a bootstrap runner: something that exists just to run the Terraform
+that stands up the rest of the infrastructure. Since it's the first thing to
+come up, it leans on nothing fancy — no CRDs, no operators, no Helm, just plain
+`ServiceAccount`, `Role`, `Secret`, `ConfigMap`, and `Deployment`. If you can
+`kubectl apply` it, you can run it.
 
 A note on the namespace before you start: on Supervisor you don't create
 namespaces with YAML. They're Supervisor Namespaces, created in vCenter under
