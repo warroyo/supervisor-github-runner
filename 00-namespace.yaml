@@ -1,0 +1,26 @@
+# 00-namespace.yaml
+#
+# Dedicated namespace for the GitHub Actions self-hosted runner(s).
+#
+# Everything in this solution lives in this single namespace so that the
+# Terraform Kubernetes backend RBAC (see 01-serviceaccount-rbac.yaml) can be
+# tightly scoped: the runner's ServiceAccount is only ever granted access to
+# secrets/leases *inside* this namespace, never cluster-wide.
+#
+# On a vSphere Supervisor cluster this namespace is a normal Kubernetes
+# namespace. The Supervisor's restricted Pod Security profile is enforced at
+# the cluster level, so the pod spec in 04-deployment.yaml is written to comply
+# with the "restricted" standard (runAsNonRoot, drop ALL capabilities, no
+# privilege escalation, no host namespaces).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: github-runners
+  labels:
+    # Belt-and-suspenders: explicitly request the restricted Pod Security
+    # Standard for this namespace. The Supervisor already enforces a restricted
+    # profile, but labeling the namespace makes the intent self-documenting and
+    # keeps the manifests portable to a vanilla cluster.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
