@@ -1,22 +1,22 @@
 # supervisor-github-runner
 
-A GitHub Actions **self-hosted, ephemeral runner** that runs as a single
+A self-hosted GitHub Actions runner that runs as a single
 [vSphere Pod](https://techdocs.broadcom.com/us/en/vmware-cis/vsphere/vsphere-supervisor/8-0/using-tkg-service-with-vsphere-supervisor/deploying-workloads-to-vsphere-pods.html)
-on a VMware vSphere **Supervisor** cluster.
+on a vSphere Supervisor cluster.
 
-It is a **bootstrap-tier runner**: its purpose is to run Terraform that
-provisions infrastructure, so it deliberately relies on **core Kubernetes
-resources only** — no CRDs, no operators, no Helm. Everything here is plain
-`ServiceAccount` / `Role` / `Secret` / `ConfigMap` / `Deployment`.
+I use this as a bootstrap runner: something that exists just to run the
+Terraform that stands up the rest of the infrastructure. Because it's the
+first thing to come up, I wanted it to lean on nothing fancy — no CRDs, no
+operators, no Helm, just plain `ServiceAccount`, `Role`, `Secret`, `ConfigMap`,
+and `Deployment`. If you can `kubectl apply` it, you can run it.
 
-> **Namespace is a prerequisite, not a manifest.** On vSphere Supervisor the
-> namespace is a **Supervisor Namespace** created in vCenter (Workload
-> Management → Namespaces), which is where its resource limits, storage, and
-> Pod Security policy come from. You cannot create it with `kubectl apply` of a
-> `Namespace` object, so there is no `namespace.yaml` here — these manifests
-> assume the namespace already exists. They use the name `github-runners`;
-> either create your Supervisor Namespace with that name, or change the
-> `namespace:` field in each manifest to match yours.
+A note on the namespace before you start: on Supervisor you don't create
+namespaces with YAML. They're Supervisor Namespaces, created in vCenter under
+Workload Management → Namespaces, and that's where their resource limits,
+storage, and Pod Security policy come from. So there's no `namespace.yaml` in
+here — the manifests assume the namespace already exists. They're written for a
+namespace called `github-runners`; either name yours that, or do a
+find-and-replace on the `namespace:` field.
 
 ## How it works
 
@@ -38,97 +38,90 @@ resources only** — no CRDs, no operators, no Helm. Everything here is plain
                          pod exits → Deployment recreates it → fresh JIT config
 ```
 
-Key design points:
+The runner is ephemeral. An init container mints a Just-In-Time runner config,
+the runner picks up exactly one job, deregisters itself, and exits. That means
+the repo's runner list never fills up with stale "offline" entries. When the
+runner exits, the Deployment recreates the pod, the init container mints a fresh
+config, and you're ready for the next job.
 
-- **Ephemeral / JIT registration.** The init container mints a Just-In-Time
-  runner config. A JIT runner runs exactly one job and then deregisters itself,
-  so the repo's runner list never accumulates stale "offline" entries. When the
-  runner exits, the `Deployment` recreates the pod and the init container mints
-  a fresh config for the next job.
-- **The App private key never touches the runner container.** All privileged
-  GitHub API work happens in the init container. The runner — which executes
-  untrusted workflow code — only ever sees the single-use JIT config blob handed
-  over through a shared `emptyDir`.
-- **No custom image.** The token-minting logic is a Python script stored in a
-  `ConfigMap` and executed by the stock `python:3-slim` image. The runner is the
-  unmodified `ghcr.io/actions/runner` image. Nothing to build or host.
-- **No persistence.** The work directory is an `emptyDir`; Terraform state is
-  stored in the [Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-  (an in-cluster `Secret` + a `Lease` for locking), not on the runner's disk.
+The interesting bit is the split between the two containers. The init container
+does all the privileged GitHub work — signing the App JWT, trading it for an
+installation token, asking for a JIT config — and the App private key is only
+ever mounted there. The runner container, which is where untrusted workflow code
+actually executes, never sees the key or the token. The two hand off through a
+shared `emptyDir`: the init container writes the JIT config, the runner reads it.
+
+There's nothing custom to build or host. The token-minting logic is a Python
+script living in a ConfigMap, run by the stock `python:3-slim` image, and the
+runner is the unmodified `ghcr.io/actions/runner` image. Nothing persists
+either — the work directory is an `emptyDir`, and Terraform state goes to the
+[Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
+(a Secret for state, a Lease for locking), so there's no reason to keep a disk
+around.
 
 ## Security model
 
-- Complies with the Supervisor's **restricted** Pod Security profile:
-  `runAsNonRoot`, no privilege escalation, **all** capabilities dropped,
-  `RuntimeDefault` seccomp, no `hostNetwork`/`hostPID`, no privileged
-  containers, and no Docker-in-Docker.
-- Both containers run as **UID 1001** — the `runner` user baked into the
-  official runner image — with `fsGroup: 1001` so the runner can read the JIT
-  file the init container writes (`0600`) on the shared `emptyDir`.
-- The `github-app` Secret is mounted into the **init container only**; the
-  runner container never has the App key or the installation token.
-- The Deployment uses `strategy: Recreate` and `replicas: 1` so there is only
-  ever one runner identity at a time.
+The pod is built to pass Supervisor's restricted Pod Security profile, so:
+`runAsNonRoot`, no privilege escalation, all capabilities dropped,
+`RuntimeDefault` seccomp, no host networking or PID, nothing privileged, and no
+Docker-in-Docker.
 
-## Files (apply in numeric order)
+Both containers run as UID 1001 — that's the `runner` user the official image
+ships with — and the pod sets `fsGroup: 1001` so the runner can read the JIT
+file the init container drops on the shared volume (written `0600`). The
+`github-app` Secret is mounted into the init container only. And with
+`replicas: 1` plus `strategy: Recreate`, there's only ever one runner identity
+alive at a time.
 
-| File | Purpose |
-|------|---------|
-| `01-serviceaccount-rbac.yaml` | `ServiceAccount` + `Role`/`RoleBinding` granting the Terraform Kubernetes backend access to **secrets** and **leases** in this namespace only. |
-| `02-secret.yaml` | The GitHub App ID + private key (placeholders — see below). |
+## What's in here
+
+Apply them in order; the numbers are the order.
+
+| File | What it does |
+|------|--------------|
+| `01-serviceaccount-rbac.yaml` | The runner's ServiceAccount, plus a Role/RoleBinding letting Terraform's Kubernetes backend touch secrets and leases — in this namespace only. |
+| `02-secret.yaml` | The GitHub App ID and private key (placeholders for now). |
 | `03-configmap-jitconfig.yaml` | The Python token-minting script. |
-| `04-deployment.yaml` | The init container + stock runner container + shared `emptyDir`. |
+| `04-deployment.yaml` | The init container, the runner container, and the shared `emptyDir` between them. |
 
-(There is no `00-namespace.yaml` — the namespace is a Supervisor Namespace
-created in vCenter; see the note at the top.)
+(No `00-namespace.yaml` on purpose — see the namespace note up top.)
 
-## Prerequisites
+## Before you start
 
-- A **Supervisor Namespace** named `github-runners` (or your own name, with the
-  `namespace:` field in each manifest changed to match), already created in
-  vCenter under **Workload Management → Namespaces**, with a `kubectl` context
-  pointing at it and permission to create the resources above.
-- The Supervisor's **restricted** Pod Security profile is satisfied by the pod
-  spec as written (`runAsNonRoot`, all capabilities dropped,
-  `allowPrivilegeEscalation: false`, `RuntimeDefault` seccomp, no host
-  namespaces, no privileged containers).
-- Egress from the Supervisor to `https://api.github.com` and to
-  `ghcr.io` / PyPI (so the init container can `pip install PyJWT`).
+You'll need a Supervisor Namespace called `github-runners` (or your own name,
+with the manifests adjusted) already created in vCenter, and a `kubectl` context
+pointed at it. The pod is already written to satisfy the restricted Pod Security
+profile, so you shouldn't have to touch any of that. The one thing worth
+checking is egress: the Supervisor needs to reach `api.github.com`, and the init
+container needs `ghcr.io` plus PyPI so it can `pip install PyJWT` on startup.
 
 ## 1. Create the GitHub App
 
-Using a GitHub App (not a Personal Access Token) keeps a long-lived user token
-out of the cluster: the init container mints a fresh, short-lived installation
-token on every pod start.
+This uses a GitHub App rather than a personal access token, so there's no
+long-lived user token sitting in the cluster — the init container mints a
+fresh, short-lived installation token every time the pod starts.
 
-1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App**
-   (under your user or org).
-2. **GitHub App name:** anything, e.g. `lab-supervisor-runner`.
-3. **Homepage URL:** any valid URL (e.g. your repo URL).
-4. **Webhook:** uncheck **Active** — this App is not driven by webhooks.
-5. **Repository permissions:** set **Self-hosted runners → Read and write.**
-   That single permission is all that is required to call
-   `generate-jitconfig`. Leave everything else as **No access**.
-6. **Where can this GitHub App be installed?** Choose **Only on this account**.
-7. Click **Create GitHub App.**
+Head to Settings → Developer settings → GitHub Apps → New GitHub App (under your
+user or org), and:
 
-### Note the App ID and generate a private key
+- Give it any name, e.g. `lab-supervisor-runner`, and any homepage URL.
+- Uncheck **Webhook → Active**; this App isn't driven by webhooks.
+- Under repository permissions, set **Self-hosted runners** to **Read and
+  write**. That's the only permission it needs — leave everything else on No
+  access.
+- Set it to be installable on this account only, then create it.
 
-- On the App's settings page, copy the numeric **App ID**.
-- Scroll to **Private keys → Generate a private key.** GitHub downloads a
-  `.pem` file. Keep it safe — this is the signing key.
+Once it's created, grab the numeric App ID from the settings page, then scroll
+down to Private keys and generate one. GitHub hands you a `.pem` file — hang
+onto it, that's your signing key.
 
-### Install the App on the target repo
+Last step, install the App on the repo it'll serve: Install App in the sidebar →
+Install → pick "Only select repositories" → choose the repo.
 
-1. On the App's settings page, open **Install App** (left sidebar).
-2. Click **Install** next to your account/org.
-3. Choose **Only select repositories** and select the target repo (the one this
-   runner will serve). Confirm.
+## 2. Create the Secret
 
-## 2. Populate the Secret
-
-Create the Secret directly from your files (recommended — avoids
-base64/whitespace mistakes with the multi-line PEM):
+Easiest to do this straight from the files you just downloaded — it sidesteps
+the base64 and whitespace headaches of pasting a multi-line PEM into YAML:
 
 ```sh
 kubectl -n github-runners create secret generic github-app \
@@ -136,15 +129,14 @@ kubectl -n github-runners create secret generic github-app \
   --from-file=private-key.pem=./your-app.private-key.pem
 ```
 
-This produces the same `github-app` Secret that `02-secret.yaml` documents
-declaratively. (If you prefer to track it in Git, edit `02-secret.yaml` and
-manage it through an encryption tool such as SOPS or Sealed Secrets — never
-commit a plaintext private key.)
+That gives you the same `github-app` Secret that `02-secret.yaml` describes. If
+you'd rather keep it in Git, edit `02-secret.yaml` instead and run it through
+something like SOPS or Sealed Secrets — just don't commit a plaintext key.
 
 ## 3. Fill in the repo placeholders
 
-Edit **`04-deployment.yaml`** and replace the two clearly-marked placeholders in
-the init container's `env`:
+Open `04-deployment.yaml` and point it at your repo by replacing the two
+placeholders in the init container's env:
 
 ```yaml
 - name: REPO_OWNER
@@ -153,13 +145,12 @@ the init container's `env`:
   value: "REPLACE_WITH_REPO_NAME"    # e.g. "supervisor-github-runner"
 ```
 
-If you populated the Secret declaratively via `02-secret.yaml` instead of the
-`kubectl create secret` command, also replace the `app-id` and
-`private-key.pem` placeholders there.
+If you went the declarative route in step 2, remember to fill in the `app-id`
+and `private-key.pem` placeholders in `02-secret.yaml` too.
 
-## 4. Apply (in order)
+## 4. Apply
 
-The Supervisor Namespace must already exist (see Prerequisites).
+With the namespace already in place:
 
 ```sh
 kubectl apply -f 01-serviceaccount-rbac.yaml
@@ -168,48 +159,45 @@ kubectl apply -f 03-configmap-jitconfig.yaml
 kubectl apply -f 04-deployment.yaml
 ```
 
-## 5. Verify the runner picks up a job and disappears cleanly
+## 5. Check that it works
 
-1. **Watch the pod come up and the init container succeed:**
+First, watch the pod come up and make sure the init container did its job:
 
-   ```sh
-   kubectl -n github-runners get pods -w
-   kubectl -n github-runners logs deploy/github-runner -c mint-jitconfig
-   ```
+```sh
+kubectl -n github-runners get pods -w
+kubectl -n github-runners logs deploy/github-runner -c mint-jitconfig
+```
 
-   The init log should end with
-   `Wrote JIT config for runner '<pod-name>' to /runner-config/jitconfig`.
+The init log should finish with something like
+`Wrote JIT config for runner '<pod-name>' to /runner-config/jitconfig`.
 
-2. **Confirm the runner connected and is idle:**
+Then tail the runner itself:
 
-   ```sh
-   kubectl -n github-runners logs deploy/github-runner -c runner -f
-   ```
+```sh
+kubectl -n github-runners logs deploy/github-runner -c runner -f
+```
 
-   You should see `Connected to GitHub` and `Listening for Jobs`. In the repo
-   under **Settings → Actions → Runners**, a runner named after the pod appears
-   with the labels `self-hosted, lab-supervisor`.
+You're looking for `Connected to GitHub` followed by `Listening for Jobs`. Over
+in the repo, under Settings → Actions → Runners, you should see a runner named
+after the pod, tagged `self-hosted, lab-supervisor`.
 
-3. **Send it a job.** Trigger a workflow that targets the labels, e.g.:
+Now give it something to do. Trigger a workflow that targets those labels:
 
-   ```yaml
-   jobs:
-     bootstrap:
-       runs-on: [self-hosted, lab-supervisor]
-       steps:
-         - run: echo "hello from the supervisor runner"
-   ```
+```yaml
+jobs:
+  bootstrap:
+    runs-on: [self-hosted, lab-supervisor]
+    steps:
+      - run: echo "hello from the supervisor runner"
+```
 
-4. **Watch it run one job and exit.** The runner logs show the job running, then
-   `Runner listener exit ...` and the pod terminates. Because the registration
-   was ephemeral/JIT, the runner **removes itself** from the repo's Runners list
-   — no stale "offline" entry is left behind.
+Watch the runner logs run the job, print `Runner listener exit ...`, and the pod
+terminates. Because the registration was JIT, the runner takes itself out of the
+repo's Runners list on the way out — no leftover "offline" entry. A moment
+later the Deployment brings the pod back, the init container mints a new config,
+and it's back to `Listening for Jobs` waiting on the next one.
 
-5. **Watch the recycle.** The `Deployment` immediately recreates the pod; the
-   init container mints a brand-new JIT config and the runner returns to
-   `Listening for Jobs`, ready for the next job.
-
-## Updating the runner version
+## Bumping the runner version
 
 The runner image is pinned in `04-deployment.yaml`:
 
@@ -217,29 +205,29 @@ The runner image is pinned in `04-deployment.yaml`:
 image: ghcr.io/actions/runner:2.335.1
 ```
 
-To upgrade, check
-[github.com/actions/runner/releases](https://github.com/actions/runner/releases)
-for the latest stable tag and bump the version (the image tag is the release
-version without the leading `v`). GitHub requires self-hosted runners to stay
-reasonably current, so update this periodically.
+When a new release lands on
+[github.com/actions/runner/releases](https://github.com/actions/runner/releases),
+bump the tag (it's the release version minus the leading `v`). GitHub expects
+self-hosted runners to stay reasonably current, so it's worth checking in on
+this now and then.
 
-## Terraform Kubernetes backend (for the workflows that run here)
+## Terraform's Kubernetes backend
 
 The RBAC in `01-serviceaccount-rbac.yaml` grants exactly what the
 [Kubernetes backend](https://developer.hashicorp.com/terraform/language/settings/backends/kubernetes)
-needs in the `github-runners` namespace: `secrets` (state) and `leases`
-(locking). Configure Terraform like:
+needs and nothing more: secrets for the state, leases for locking, scoped to
+`github-runners`. Configure Terraform like this:
 
 ```hcl
 terraform {
   backend "kubernetes" {
-    secret_suffix = "bootstrap"
-    namespace     = "github-runners"
-    in_cluster_config = true   # uses the pod's ServiceAccount token
+    secret_suffix     = "bootstrap"
+    namespace         = "github-runners"
+    in_cluster_config = true   # use the pod's ServiceAccount token
   }
 }
 ```
 
-Because `in_cluster_config = true`, Terraform authenticates as the
-`github-runner` ServiceAccount and the backend can read/write its state Secret
-and acquire its lock Lease without any extra credentials.
+With `in_cluster_config = true`, Terraform authenticates as the `github-runner`
+ServiceAccount, so the backend can manage its state Secret and grab its lock
+Lease without any extra credentials.
