@@ -1,0 +1,35 @@
+# An overlay: two runners for an organization, with their own labels and
+# more memory. Copy it, change the values, and apply it with:
+#
+#   kubectl -n <namespace> apply -k .
+#
+# The Secret github-app is not here. Create it with kubectl, so the key
+# stays out of git.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - https://github.com/warroyo/supervisor-github-runner//base?ref=main
+
+# The base reads the ConfigMap by this exact name, so no hash suffix.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: github-runner
+    literals:
+      - GITHUB_URL=https://github.com/my-org
+      - RUNNER_LABELS=self-hosted,supervisor,terraform
+
+replicas:
+  - name: github-runner
+    count: 2
+
+patches:
+  - target:
+      kind: Deployment
+      name: github-runner
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 8Gi

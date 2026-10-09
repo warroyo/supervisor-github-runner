@@ -1,0 +1,83 @@
+# Runner pod: one container. entrypoint.sh mints a JIT config and starts the
+# stock runner with it. Ephemeral: one job, then the container restarts.
+# See the README for the full design, lifecycle, and security notes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-runner
+  labels:
+    app: github-runner
+spec:
+  # One pod is one runner, and one runner takes one job at a time.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-runner
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: github-runner
+    spec:
+      # The runner has no reason to reach the Kubernetes API, so don't mount a
+      # token for it (it uses the namespace default ServiceAccount).
+      automountServiceAccountToken: false
+      # UID 1001 is the runner image's "runner" user.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # Unmodified upstream runner, pinned.
+        - name: runner
+          image: ghcr.io/actions/actions-runner:2.338.0
+          command: ["/bin/bash", "/entrypoint/entrypoint.sh"]
+          # GITHUB_URL, and optionally RUNNER_LABELS and RUNNER_GROUP_ID.
+          envFrom:
+            - configMapRef:
+                name: github-runner
+          # The App's credentials come from the environment and not a mounted
+          # file: entrypoint.sh unsets them before the job starts. A mounted
+          # file would stay readable by the job.
+          env:
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app
+                  key: app-id
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: github-app
+                  key: private-key.pem
+            - name: RUNNER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /entrypoint
+              readOnly: true
+            - name: work
+              mountPath: /home/runner/_work
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: github-runner-entrypoint
+        - name: work
+          emptyDir: {}
