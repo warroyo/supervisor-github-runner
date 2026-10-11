@@ -1,0 +1,9 @@
+# Opens a pull request when a newer runner image is released. GitHub stops
+# sending jobs to runners that fall too far behind, so the pin in
+# base/deployment.yaml has to keep moving.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /base
+    schedule:
+      interval: weekly
