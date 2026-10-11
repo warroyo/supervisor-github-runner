@@ -95,6 +95,7 @@ from a fork gets to run there too.
 | `base/entrypoint.sh` | Mints the JIT config and starts the runner. |
 | `base/kustomization.yaml` | Ties the two together; the script becomes a ConfigMap. |
 | `examples/org/` | An overlay showing how to change replicas, labels, and memory. |
+| `.github/dependabot.yml` | Keeps the pinned runner image current. |
 
 ## Before you start
 
@@ -209,6 +210,26 @@ Kubernetes backs off between restarts of the same container: after several
 short jobs in a row the wait grows, up to five minutes, and a queued job waits
 with it. It resets once a runner has been up for ten minutes.
 
+## Deleting the pod cancels its job
+
+Anything that deletes the pod takes the running job with it: a rollout (the
+Deployment uses `strategy: Recreate`), scaling down, `kubectl delete pod`, or
+the host going into maintenance. The runner gets the default 30 seconds to
+stop, and GitHub marks the job as cancelled or failed.
+
+For most jobs that just means running it again. For a job that changes real
+things it's worse — a `terraform apply` stopped halfway leaves a half-applied
+change and a state lock that nobody holds, which you clear with
+`terraform force-unlock`. So check that the runner is idle before you roll it
+out, bump the image, or scale down:
+
+```sh
+kubectl -n <namespace> logs deploy/github-runner --tail=5
+```
+
+`Listening for Jobs` as the last line means it's safe. `Running job: ...`
+means wait.
+
 ## Bumping the runner version
 
 The runner image is pinned in `base/deployment.yaml`:
@@ -220,8 +241,13 @@ image: ghcr.io/actions/actions-runner:2.338.0
 When a new release lands on
 [github.com/actions/runner/releases](https://github.com/actions/runner/releases),
 bump the tag (it's the release version minus the leading `v`). GitHub expects
-self-hosted runners to stay reasonably current, so it's worth checking in on
-this now and then.
+self-hosted runners to stay reasonably current, and one that falls too far
+behind stops getting jobs without telling you.
+
+This repo has a Dependabot config (`.github/dependabot.yml`) that opens a pull
+request for each new image. If you apply the base straight from GitHub, the new
+version reaches you the next time you run `kubectl apply -k`. If you keep your
+own copy, point Dependabot or Renovate at it the same way.
 
 ## License
 
