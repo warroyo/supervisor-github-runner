@@ -68,16 +68,26 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          # ephemeral-storage is the pod's disk. A vSphere Pod gets about
+          # 250 MB unless it asks for more, which one set of Terraform
+          # providers already fills. Keep it equal to the work volume's
+          # sizeLimit below: the pod needs both to get the space.
           resources:
             requests:
               cpu: 500m
               memory: 512Mi
+              ephemeral-storage: 4Gi
             limits:
               cpu: "2"
               memory: 2Gi
+              ephemeral-storage: 4Gi
       volumes:
         - name: entrypoint
           configMap:
             name: github-runner-entrypoint
+        # The job's files: the checkout, tools, caches. It's the pod's own
+        # disk, created and deleted with the pod, so there's no PVC to clean
+        # up afterwards.
         - name: work
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 4Gi
