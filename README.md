@@ -94,7 +94,7 @@ from a fork gets to run there too.
 | `base/deployment.yaml` | The runner Deployment. |
 | `base/entrypoint.sh` | Mints the JIT config and starts the runner. |
 | `base/kustomization.yaml` | Ties the two together; the script becomes a ConfigMap. |
-| `examples/org/` | An overlay showing how to change replicas, labels, and memory. |
+| `examples/org/` | An overlay showing how to change replicas, labels, memory, and disk. |
 | `.github/dependabot.yml` | Keeps the pinned runner image current. |
 
 ## Before you start
@@ -170,7 +170,7 @@ kubectl -n <namespace> apply -k 'https://github.com/warroyo/supervisor-github-ru
 
 Or from a checkout: `kubectl -n <namespace> apply -k base`.
 
-For more than the defaults — more runners, more memory — copy
+For more than the defaults — more runners, more memory, more disk — copy
 [`examples/org`](examples/org) and apply that instead. One pod is one runner
 and takes one job at a time, so `replicas` is how many jobs run at once.
 
@@ -209,6 +209,22 @@ back, the script mints a new config, and it's back to `Listening for Jobs`.
 Kubernetes backs off between restarts of the same container: after several
 short jobs in a row the wait grows, up to five minutes, and a queued job waits
 with it. It resets once a runner has been up for ten minutes.
+
+## Disk space
+
+A job gets 4 GB of disk, mounted at the runner's work directory. That's where
+the checkout, downloaded tools, and things like Terraform providers land.
+
+It's worth knowing why that number is set at all. A vSphere Pod only gets
+about 250 MB of disk unless it asks for more, and a job that runs out fails
+with `no space left on device` — `terraform init` hits it on the first
+provider download. The pod has to ask in two places, and it needs both: the
+container's `ephemeral-storage` request and limit, and the `sizeLimit` on the
+`work` volume. Keep the two equal.
+
+The disk belongs to the pod. It's created with the pod and deleted with it, so
+there's no PersistentVolumeClaim and nothing left behind to clean up. The
+[`examples/org`](examples/org) overlay shows how to make it bigger.
 
 ## Deleting the pod cancels its job
 

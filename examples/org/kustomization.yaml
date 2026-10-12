@@ -1,5 +1,5 @@
-# An overlay: two runners for an organization, with their own labels and
-# more memory. Copy it, change the values, and apply it with:
+# An overlay: two runners for an organization, with their own labels, more
+# memory, and more disk. Copy it, change the values, and apply it with:
 #
 #   kubectl -n <namespace> apply -k .
 #
@@ -33,3 +33,14 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/resources/limits/memory
         value: 8Gi
+      # Disk for the job. All three must be the same value. The work volume
+      # is the second one in the base.
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/ephemeral-storage
+        value: 10Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/ephemeral-storage
+        value: 10Gi
+      - op: replace
+        path: /spec/template/spec/volumes/1/emptyDir/sizeLimit
+        value: 10Gi
