@@ -1,6 +1,7 @@
-# Runner pod: one container. entrypoint.sh mints a JIT config and starts the
-# stock runner with it. Ephemeral: one job, then the container restarts.
-# See the README for the full design, lifecycle, and security notes.
+# Runner pod: two containers from the same stock runner image. minter holds
+# the GitHub App's key and mints one just-in-time runner config at a time
+# (mint.sh). runner takes each config, runs one job with it, and loops
+# (entrypoint.sh). See the README for the design and the security notes.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,13 +37,44 @@ spec:
         - name: runner
           image: ghcr.io/actions/actions-runner:2.338.0
           command: ["/bin/bash", "/entrypoint/entrypoint.sh"]
+          # No App credentials here: jobs run in this container.
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /entrypoint
+              readOnly: true
+            - name: work
+              mountPath: /home/runner/_work
+            - name: handoff
+              mountPath: /handoff
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # ephemeral-storage is the pod's disk. A vSphere Pod gets about
+          # 250 MB unless it asks for more, which one set of Terraform
+          # providers already fills. Keep it equal to the work volume's
+          # sizeLimit below: the pod needs both to get the space.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 4Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 4Gi
+        # Mints the runner's configs. The same image, for its curl, jq and
+        # openssl. No job runs in this container, and the pods do not share
+        # a process namespace, so the job cannot read its environment.
+        - name: minter
+          image: ghcr.io/actions/actions-runner:2.338.0
+          command: ["/bin/bash", "/entrypoint/mint.sh"]
           # GITHUB_URL, and optionally RUNNER_LABELS and RUNNER_GROUP_ID.
           envFrom:
             - configMapRef:
                 name: github-runner
-          # The App's credentials come from the environment and not a mounted
-          # file: entrypoint.sh unsets them before the job starts. A mounted
-          # file would stay readable by the job.
+          # From the environment and not a mounted file, so the key is in no
+          # volume the runner container could share.
           env:
             - name: GITHUB_APP_ID
               valueFrom:
@@ -62,25 +94,23 @@ spec:
             - name: entrypoint
               mountPath: /entrypoint
               readOnly: true
-            - name: work
-              mountPath: /home/runner/_work
+            - name: handoff
+              mountPath: /handoff
+            - name: state
+              mountPath: /state
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-          # ephemeral-storage is the pod's disk. A vSphere Pod gets about
-          # 250 MB unless it asks for more, which one set of Terraform
-          # providers already fills. Keep it equal to the work volume's
-          # sizeLimit below: the pod needs both to get the space.
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
-              ephemeral-storage: 4Gi
+              cpu: 50m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
             limits:
-              cpu: "2"
-              memory: 2Gi
-              ephemeral-storage: 4Gi
+              cpu: 250m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
       volumes:
         - name: entrypoint
           configMap:
@@ -91,3 +121,11 @@ spec:
         - name: work
           emptyDir:
             sizeLimit: 4Gi
+        # One config at a time, from minter to runner.
+        - name: handoff
+          emptyDir:
+            sizeLimit: 1Mi
+        # Which runner minter minted last. Only minter mounts it.
+        - name: state
+          emptyDir:
+            sizeLimit: 1Mi

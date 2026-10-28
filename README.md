@@ -31,39 +31,52 @@ when you apply.
 ## How it works
 
 ```
-                 ┌──────────────────── Pod ─────────────────────┐
-                 │                                               │
-  github-app     │  container: runner (ghcr.io/actions/actions-runner)
-  Secret  ──────►│    entrypoint.sh                              │
-  (App key,      │      1. sign JWT with App private key (RS256) │
-   as env)       │      2. JWT → installation access token       │
-                 │      3. POST .../generate-jitconfig           │
-  github-runner  │      4. unset the key and the token           │
-  ConfigMap ────►│      5. exec run.sh --jitconfig ...           │
-  (GITHUB_URL)   │           → runs exactly ONE job,             │
-                 │             deregisters, exits                │
-                 └───────────────────────────────────────────────┘
-                   container exits → kubelet restarts it → fresh JIT config
+  github-app Secret ─┐     ┌──────────────────── Pod ─────────────────────┐
+  (App key, as env)  └────►│ container: minter           (mint.sh)         │
+  github-runner          ┌►│   JWT → installation token (cached 50 min)    │
+  ConfigMap ─────────────┘ │   POST .../generate-jitconfig                 │
+  (GITHUB_URL)             │   write config ──────────┐                    │
+                           │   wait until GitHub no   │                    │
+                           │   longer lists the runner│                    │
+                           │                          ▼ handoff (emptyDir) │
+                           │ container: runner      (entrypoint.sh)        │
+                           │   wait for config, read and delete it         │
+                           │   empty _work                                 │
+                           │   run.sh --jitconfig → ONE job, deregisters   │
+                           │   kill leftover processes, loop               │
+                           └───────────────────────────────────────────────┘
 ```
 
-The runner is ephemeral. On every start, `entrypoint.sh` mints a Just-In-Time
-runner config, the runner picks up exactly one job, deregisters itself, and
-exits. That means the runner list never fills up with stale "offline" entries.
-When the runner exits, Kubernetes restarts the container, the script mints a
-fresh config, and you're ready for the next job.
+The runner is ephemeral. Each config is a Just-In-Time registration, the runner
+picks up exactly one job, deregisters itself, and the runner list never fills
+up with stale "offline" entries.
 
-There's nothing custom to build or host. The token-minting logic is a shell
-script living in a ConfigMap, and it only uses what the unmodified
-`ghcr.io/actions/actions-runner` image already ships: `curl`, `jq`, and
-`openssl`. Nothing persists either — the work directory is an `emptyDir`, and
-the script empties it before each job. If a workflow needs durable state, keep
-it off the runner and in a remote backend (an object store, a Terraform remote
-backend, and so on).
+The pod has two containers, both from the same stock image. `minter` runs
+`mint.sh`. It's the only container with the GitHub App key. It mints one JIT
+config at a time and drops it in a shared `handoff` volume. `runner` runs
+`entrypoint.sh`, a loop: wait for a config, run one job with it, kill whatever
+the job left running, wait for the next one. It never exits, so Kubernetes
+never applies restart backoff, and the next job starts within seconds of the
+last one finishing.
 
-Why one container and not an init container for the minting: Kubernetes runs
-init containers once per pod, not once per container restart. A runner that
-exits after its job gets restarted in place, the init container doesn't run
-again, and the runner comes back with a JIT config that has already been used.
+`minter` mints the next config only after GitHub no longer lists the previous
+runner. It polls the runner every 10 seconds, treats a 404 as gone, then waits
+5 more seconds. If a runner took its config and stays offline for 180 seconds,
+it died without leaving GitHub, so `minter` deletes it through the API and mints
+the next. It caches the installation token and gets a new one after 50 minutes.
+Errors are retried every 30 seconds; the container doesn't exit.
+
+There's nothing custom to build or host. Both scripts live in a ConfigMap, and
+they only use what the unmodified `ghcr.io/actions/actions-runner` image already
+ships: `curl`, `jq`, and `openssl`. The only state is the `work` directory, an
+`emptyDir` that the script empties before each job. If a workflow needs durable
+state, keep it off the runner and in a remote backend (an object store, a
+Terraform remote backend, and so on).
+
+Why a sidecar and not an init container for the minting: Kubernetes runs init
+containers once per pod, not once per job. The runner needs a new config after
+every job, so something has to keep running next to it, and that's `minter`.
+It's also what keeps the key out of the container that runs your jobs.
 
 ## Security model
 
@@ -73,11 +86,23 @@ The pod is built to pass Supervisor's restricted Pod Security profile, so:
 Docker-in-Docker. It runs as UID 1001 — that's the `runner` user the official
 image ships with.
 
-The App private key reaches the container as an environment variable, not a
-mounted file. `entrypoint.sh` signs with it through a pipe, so it never lands
-on disk, then unsets it along with the installation token before it `exec`s the
-runner. Workflow code runs as a child of that process, so it never has the key
-or the token in its environment, and there's no file to read them from.
+The App private key reaches only the `minter` container, as an environment
+variable, not a mounted file. It signs through a pipe, so the key never lands on
+disk. Jobs run in the `runner` container, which has no App credentials at all.
+The containers don't share a process namespace, so a job can't read the
+minter's environment or `/proc`. In testing, a job saw no `GITHUB_APP_*`
+variables.
+
+A job also can't get a config for a runner of its own. `minter` only mints after
+the job's runner has left GitHub, and the `runner` container kills every
+leftover process before that. Each job still gets a fresh one-time JIT
+registration.
+
+One thing changed from running one container per job: the container now
+persists across jobs. The workspace (`_work`) is emptied between jobs, but the
+rest of the container's filesystem isn't, so something a job writes to the home
+directory, like a cache or a config file, is still there for the next job.
+Don't treat the runner as clean between jobs outside `_work`.
 
 The pod sets `automountServiceAccountToken: false`, so the untrusted workflow
 code the runner executes gets no Kubernetes API token at all.
@@ -92,8 +117,9 @@ from a fork gets to run there too.
 | Path | What it does |
 |------|--------------|
 | `base/deployment.yaml` | The runner Deployment. |
-| `base/entrypoint.sh` | Mints the JIT config and starts the runner. |
-| `base/kustomization.yaml` | Ties the two together; the script becomes a ConfigMap. |
+| `base/mint.sh` | The `minter` container: holds the App key and mints one JIT config at a time. |
+| `base/entrypoint.sh` | The `runner` container: loops, running one job per config. |
+| `base/kustomization.yaml` | Ties them together; the two scripts become a ConfigMap. |
 | `examples/org/` | An overlay showing how to change replicas, labels, memory, and disk. |
 | `.github/dependabot.yml` | Keeps the pinned runner image current. |
 
@@ -109,8 +135,8 @@ for the runner itself.
 ## 1. Create the GitHub App
 
 This uses a GitHub App rather than a personal access token, so there's no
-long-lived user token sitting in the cluster — the script mints a fresh,
-short-lived installation token every time the container starts.
+long-lived user token sitting in the cluster — `minter` mints a fresh,
+short-lived installation token about every 50 minutes.
 
 Head to Settings → Developer settings → GitHub Apps → New GitHub App (under the
 org or user that owns what the runner will serve), and:
@@ -178,18 +204,19 @@ and takes one job at a time, so `replicas` is how many jobs run at once.
 
 ```sh
 kubectl -n <namespace> get pods -w
-kubectl -n <namespace> logs deploy/github-runner -f
+kubectl -n <namespace> logs deploy/github-runner -c minter -f
+kubectl -n <namespace> logs deploy/github-runner -c runner -f
 ```
 
-You're looking for `Registered runner <pod-name>-<suffix>`, then
-`Connected to GitHub` followed by `Listening for Jobs`. Over in GitHub, under
-Settings → Actions → Runners, you should see a runner with that name and your
-labels.
+`minter` should print `Minted runner <pod-name>-<suffix>`. In the `runner` log
+you're looking for `Connected to GitHub` followed by `Listening for Jobs`. Over
+in GitHub, under Settings → Actions → Runners, you should see a runner with that
+name and your labels.
 
-If the script stops earlier, it prints the GitHub API call that failed and
-GitHub's answer. A `404` on `/installation` means the App isn't installed on
-that organization or repository; a `403` on `generate-jitconfig` means the
-permission from step 1 is missing.
+If `minter` stops earlier, it prints the GitHub API call that failed and
+GitHub's answer, then tries again in 30 seconds. A `404` on `/installation`
+means the App isn't installed on that organization or repository; a `403` on
+`generate-jitconfig` means the permission from step 1 is missing.
 
 Now give it something to do. Trigger a workflow that targets those labels:
 
@@ -203,12 +230,9 @@ jobs:
 
 Watch the runner logs run the job and print `Runner listener exit ...`. Because
 the registration was JIT, the runner takes itself out of the Runners list on
-the way out — no leftover "offline" entry. A moment later the container is
-back, the script mints a new config, and it's back to `Listening for Jobs`.
-
-Kubernetes backs off between restarts of the same container: after several
-short jobs in a row the wait grows, up to five minutes, and a queued job waits
-with it. It resets once a runner has been up for ten minutes.
+the way out — no leftover "offline" entry. The runner loops, so the next job
+starts within seconds: `minter` waits for the old runner to leave GitHub, mints
+a new config, and `runner` is back to `Listening for Jobs`.
 
 ## Disk space
 
@@ -240,7 +264,7 @@ change and a state lock that nobody holds, which you clear with
 out, bump the image, or scale down:
 
 ```sh
-kubectl -n <namespace> logs deploy/github-runner --tail=5
+kubectl -n <namespace> logs deploy/github-runner -c runner --tail=5
 ```
 
 `Listening for Jobs` as the last line means it's safe. `Running job: ...`
