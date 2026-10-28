@@ -4,9 +4,10 @@ kind: Kustomization
 resources:
   - deployment.yaml
 
-# The generated name carries a hash of the script, so a change to
-# entrypoint.sh rolls the pod.
+# The generated name carries a hash of the scripts, so a change to either
+# rolls the pod.
 configMapGenerator:
   - name: github-runner-entrypoint
     files:
       - entrypoint.sh
+      - mint.sh
