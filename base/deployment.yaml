@@ -35,7 +35,7 @@ spec:
       containers:
         # Unmodified upstream runner, pinned.
         - name: runner
-          image: ghcr.io/actions/actions-runner:2.338.0
+          image: ghcr.io/actions/actions-runner:2.338.2
           command: ["/bin/bash", "/entrypoint/entrypoint.sh"]
           # No App credentials here: jobs run in this container.
           volumeMounts:
@@ -67,7 +67,7 @@ spec:
         # openssl. No job runs in this container, and the pods do not share
         # a process namespace, so the job cannot read its environment.
         - name: minter
-          image: ghcr.io/actions/actions-runner:2.338.0
+          image: ghcr.io/actions/actions-runner:2.338.2
           command: ["/bin/bash", "/entrypoint/mint.sh"]
           # GITHUB_URL, and optionally RUNNER_LABELS and RUNNER_GROUP_ID.
           envFrom:
